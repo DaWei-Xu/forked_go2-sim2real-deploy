@@ -11,17 +11,16 @@ MODE = "robot_run"  # "dummy" | "robot_print" | "robot_run"
 
 DUMMY_YAML_PATH = "dummy_state.yaml"  ## to test off the robot
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CKPT_PATH = os.path.join(SCRIPT_DIR, "model_29000.pt")
+CKPT_PATH = os.path.join(SCRIPT_DIR, "walk.pt")
 
 # ============================================================
-# PREDEFINED VELOCITIES (edit these to change speed)
+# INCREMENTAL VELOCITY CONTROL
+# Each key press steps the corresponding velocity by VEL_STEP.
 # ============================================================
-FORWARD_VX = 0.4  # W key: forward speed
-BACKWARD_VX = 0.4  # S key: backward speed
-LEFT_VY = 0.5  # A key: negative vy (left)
-RIGHT_VY = 0.5  # D key: positive vy (right)w
-YAW_CW_WZ = 0.7  # Q key: clockwise yaw
-YAW_CCW_WZ = 0.7  # R key: counter-clockwise yaw
+VEL_STEP = 0.1      # m/s or rad/s per key press
+MAX_VX   = 1.0      # forward/backward limit (m/s)
+MAX_VY   = 1.0      # lateral limit (m/s)
+MAX_WZ   = 1.5      # yaw limit (rad/s)
 
 # ============================================================
 
@@ -113,6 +112,21 @@ DEFAULT_DOF_POS = torch.tensor(
     dtype=torch.float32,
 )
 STAND_DOF_POS = DEFAULT_DOF_POS.clone()
+
+# ============================================================
+# BODY HEIGHT CONTROL (Z = lower, C = raise)
+# Shifts thigh joints (indices 1,4,7,10) from DEFAULT_DOF_POS.
+# Positive offset = more bent knees = lower body.
+# ============================================================
+HEIGHT_STEP = 0.1        # rad per key press
+HEIGHT_MAX  = 0.5        # max offset in either direction (rad)
+height_offset = 0.0      # current offset, modified at runtime
+
+
+def get_default_dof_pos():
+    pos = DEFAULT_DOF_POS.clone()
+    pos[[1, 4, 7, 10]] += height_offset
+    return pos
 
 
 # ============================================================
@@ -226,7 +240,7 @@ def build_obs(raw, command_3, last_action):
             gyro * OBS_SCALES["ang_vel"],  # 3
             proj_g,  # 3
             cmd * cmd_scale,  # 3
-            (q - DEFAULT_DOF_POS) * OBS_SCALES["dof_pos"],  # 12
+            (q - get_default_dof_pos()) * OBS_SCALES["dof_pos"],  # 12
             dq * OBS_SCALES["dof_vel"],  # 12
             last_action,  # NUM_ACT (16 with PLS)
         ],
@@ -483,49 +497,40 @@ def handle_key(key):
     ):  # Changed quit key to 'x' to avoid conflict with 's'
         return False
 
-    # WASD + Q/R controls
+    global height_offset
+
+    # WASD + Q/R: each press increments the relevant velocity by VEL_STEP
     if key == "w":
-        command_state["vx"] = FORWARD_VX
-        command_state["vy"] = 0.0
-        command_state["wz"] = 0.0
+        command_state["vx"] = min(command_state["vx"] + VEL_STEP, MAX_VX)
     elif key == "s":
-        command_state["vx"] = -BACKWARD_VX
-        command_state["vy"] = 0.0
-        command_state["wz"] = 0.0
+        command_state["vx"] = max(command_state["vx"] - VEL_STEP, -MAX_VX)
     elif key == "d":
-        command_state["vx"] = 0.0
-        command_state["vy"] = RIGHT_VY
-        command_state["wz"] = 0.0
+        command_state["vy"] = min(command_state["vy"] + VEL_STEP, MAX_VY)
     elif key == "a":
-        command_state["vx"] = 0.0
-        command_state["vy"] = -LEFT_VY
-        command_state["wz"] = 0.0
+        command_state["vy"] = max(command_state["vy"] - VEL_STEP, -MAX_VY)
     elif key == "q":
-        command_state["vx"] = 0.0
-        command_state["vy"] = 0.0
-        command_state["wz"] = -YAW_CW_WZ
+        command_state["wz"] = max(command_state["wz"] - VEL_STEP, -MAX_WZ)
     elif key == "r":
-        command_state["vx"] = 0.0
-        command_state["vy"] = 0.0
-        command_state["wz"] = YAW_CCW_WZ
+        command_state["wz"] = min(command_state["wz"] + VEL_STEP, MAX_WZ)
     elif key == " ":
-        # Spacebar: zero velocity command (stays in policy mode)
         command_state["vx"] = 0.0
         command_state["vy"] = 0.0
         command_state["wz"] = 0.0
+    elif key == "z":
+        height_offset = min(height_offset + HEIGHT_STEP, HEIGHT_MAX)
+    elif key == "c":
+        height_offset = max(height_offset - HEIGHT_STEP, -HEIGHT_MAX)
 
     return True
 
 
 def print_controls():
     print("\n============ CONTROLS ============")
-    print(f"  W           : forward   (vx={FORWARD_VX:.2f})")
-    print(f"  S           : backward  (vx={-BACKWARD_VX:.2f})")
-    print(f"  D           : right     (vy={RIGHT_VY:.2f})")
-    print(f"  A           : left      (vy={-LEFT_VY:.2f})")
-    print(f"  Q           : yaw CW    (wz={-YAW_CW_WZ:.2f})")
-    print(f"  R           : yaw CCW   (wz={YAW_CCW_WZ:.2f})")
-    print("  SPACE       : zero velocity (policy keeps running)")
+    print(f"  W / S       : vx  +/- {VEL_STEP:.1f} m/s   (max ±{MAX_VX:.1f})")
+    print(f"  D / A       : vy  +/- {VEL_STEP:.1f} m/s   (max ±{MAX_VY:.1f})")
+    print(f"  R / Q       : wz  +/- {VEL_STEP:.1f} rad/s (max ±{MAX_WZ:.1f})")
+    print(f"  Z / C       : body lower / raise ({HEIGHT_STEP:.1f} rad/press, max ±{HEIGHT_MAX:.1f})")
+    print("  SPACE       : zero all velocities")
     print("  E           : return to stand")
     print("  X           : quit")
     print("==================================\n")
@@ -621,7 +626,7 @@ def run_robot_print(policy):
 
         # Split: position (12) + stiffness (4)
         pos_action = action_clip[:NUM_POS_ACTIONS]
-        target_q = DEFAULT_DOF_POS + ACTION_SCALE * pos_action
+        target_q = get_default_dof_pos() + ACTION_SCALE * pos_action
 
         # Compute Kp/Kd from network stiffness output
         kp_12, kd_12 = None, None
@@ -732,7 +737,7 @@ def run_robot_run(policy):
 
     for k in range(ramp_steps):
         alpha = (k + 1) / float(ramp_steps)
-        desired = (1 - alpha) * start_q + alpha * STAND_DOF_POS
+        desired = (1 - alpha) * start_q + alpha * get_default_dof_pos()
         desired = slew_limit(prev_q, desired, MAX_STEP_RAD)
         shared["target_q"] = desired.clone()
         prev_q = desired.clone()
@@ -817,14 +822,14 @@ def run_robot_run(policy):
                         shared["kd_per_joint"][:] = POLICY_KD_FALLBACK
                         last_action_for_obs = torch.zeros(NUM_ACT, dtype=torch.float32)
                         prev_policy_action = torch.zeros(NUM_ACT, dtype=torch.float32)
-                        prev_target_q = STAND_DOF_POS.clone()
+                        prev_target_q = get_default_dof_pos()
                         step = 0
                         # Process the key
                         handle_key(key)
                     else:
                         # Stay in stand pose
-                        shared["target_q"] = STAND_DOF_POS.clone()
-                        prev_target_q = STAND_DOF_POS.clone()
+                        shared["target_q"] = get_default_dof_pos()
+                        prev_target_q = get_default_dof_pos()
                         if key:
                             handle_key(key)  # Update command even if not moving
                         continue
@@ -865,7 +870,7 @@ def run_robot_run(policy):
 
                         # Split: position (12) + stiffness (4)
                         pos_action = exec_action[:NUM_POS_ACTIONS]
-                        policy_target_q = DEFAULT_DOF_POS + ACTION_SCALE * pos_action
+                        policy_target_q = get_default_dof_pos() + ACTION_SCALE * pos_action
                         target_q = slew_limit(
                             prev_target_q, policy_target_q, MAX_STEP_RAD
                         )
@@ -896,7 +901,7 @@ def run_robot_run(policy):
                 elif current_state == STATE_TRANSITION:
                     # Smoothly ramp back to stand pose
                     alpha = min(1.0, (transition_step + 1) / float(transition_steps))
-                    desired = (1 - alpha) * transition_start_q + alpha * STAND_DOF_POS
+                    desired = (1 - alpha) * transition_start_q + alpha * get_default_dof_pos()
                     desired = slew_limit(prev_target_q, desired, MAX_STEP_RAD)
 
                     shared["target_q"] = desired.clone()
@@ -989,7 +994,7 @@ def main():
 
         # Split: position + stiffness
         pos_action = action_clip[:NUM_POS_ACTIONS]
-        target_q = DEFAULT_DOF_POS + ACTION_SCALE * pos_action
+        target_q = get_default_dof_pos() + ACTION_SCALE * pos_action
 
         kp_12, kd_12 = None, None
         if PLS_ENABLE and action_clip.shape[0] > NUM_POS_ACTIONS:
