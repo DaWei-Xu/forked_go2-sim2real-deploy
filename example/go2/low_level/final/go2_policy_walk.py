@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import time
@@ -471,6 +472,21 @@ class RawTerminal:
             return ch
 
 
+# ============================================================
+# HEADING TRACKING — prevents yaw drift during straight-line walking
+#
+# When the user commands wz=0, we lock to the current robot heading and
+# feed wz_eff = HEADING_KP * wrap_to_pi(target_yaw - current_yaw) as the
+# wz command to the policy.  This converts accumulated heading drift into
+# a correction signal without changing the trained obs structure.
+#
+# HEADING_KP tuning:
+#   - Too low  → robot still drifts gradually
+#   - Too high → robot overcorrects and oscillates in yaw
+#   - Start at 1.5; increase if drift persists, decrease if oscillation appears
+# ============================================================
+HEADING_KP = 2.8
+
 # Shared mutable command state
 command_state = {
     "vx": 0.0,
@@ -478,9 +494,64 @@ command_state = {
     "wz": 0.0,
 }
 
+# Heading lock state (updated each policy step)
+_heading_state = {
+    "target_yaw": None,  # locked heading in world frame (radians)
+    "locked": False,     # whether heading lock is currently active
+}
 
-def make_command_list():
-    return [command_state["vx"], command_state["vy"], command_state["wz"]]
+
+def _yaw_from_quat_wxyz(q_wxyz):
+    """Extract world-frame yaw from quaternion [w, x, y, z]."""
+    w, x, y, z = q_wxyz
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def _wrap_to_pi(angle):
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def make_command_list(raw=None):
+    """
+    Return [vx, vy, wz_effective] for the policy.
+
+    When wz=0 and the robot is moving (|vx|+|vy| > 0.05 m/s) and raw IMU
+    data is available, activate heading-lock mode:
+      - On first entry: lock target_yaw to the current robot heading.
+      - Each step: wz_eff = clip(HEADING_KP * wrap_to_pi(target - current), ±MAX_WZ)
+
+    When wz != 0 (user is steering):
+      - Use raw wz command.
+      - Keep updating target_yaw = current_yaw so that releasing the joystick
+        locks to the new heading without a snap.
+    """
+    vx = command_state["vx"]
+    vy = command_state["vy"]
+    wz_user = command_state["wz"]
+
+    # No correction when standing still or no IMU available
+    if raw is None or abs(vx) + abs(vy) < 0.05:
+        _heading_state["locked"] = False
+        _heading_state["target_yaw"] = None
+        return [vx, vy, wz_user]
+
+    current_yaw = _yaw_from_quat_wxyz(raw["imu"]["quat_wxyz"])
+
+    if abs(wz_user) > 0.01:
+        # User is steering: track current heading so releasing wz snaps cleanly
+        _heading_state["target_yaw"] = current_yaw
+        _heading_state["locked"] = False
+        return [vx, vy, wz_user]
+
+    # wz ≈ 0 and robot is moving: heading-lock mode
+    if not _heading_state["locked"] or _heading_state["target_yaw"] is None:
+        _heading_state["target_yaw"] = current_yaw
+        _heading_state["locked"] = True
+
+    heading_error = _wrap_to_pi(_heading_state["target_yaw"] - current_yaw)
+    wz_eff = float(max(-MAX_WZ, min(MAX_WZ, HEADING_KP * heading_error)))
+
+    return [vx, vy, wz_eff]
 
 
 def handle_key(key):
@@ -616,7 +687,7 @@ def run_robot_print(policy):
     while True:
         raw = lowstate_to_raw(latest["msg"])
 
-        command = make_command_list()
+        command = make_command_list(raw)
         obs = build_obs(raw, command, last_action)
 
         with torch.no_grad():
@@ -824,6 +895,10 @@ def run_robot_run(policy):
                         prev_policy_action = torch.zeros(NUM_ACT, dtype=torch.float32)
                         prev_target_q = get_default_dof_pos()
                         step = 0
+                        # Reset heading lock so it captures the current heading on
+                        # the first policy step rather than using a stale target
+                        _heading_state["locked"] = False
+                        _heading_state["target_yaw"] = None
                         # Process the key
                         handle_key(key)
                     else:
@@ -852,7 +927,7 @@ def run_robot_run(policy):
                             break
 
                         raw = lowstate_to_raw(latest["msg"])
-                        command = make_command_list()
+                        command = make_command_list(raw)
                         obs = build_obs(raw, command, last_action_for_obs)
 
                         with torch.no_grad():
@@ -935,6 +1010,8 @@ def run_robot_run(policy):
                                 NUM_ACT, dtype=torch.float32
                             )
                             step = 0
+                            _heading_state["locked"] = False
+                            _heading_state["target_yaw"] = None
                             handle_key(key)
 
     except KeyboardInterrupt:
